@@ -1,15 +1,22 @@
-# SKYWHALE — The Ocean Learned to Fly
+# SKYWHALE — the ocean learned to fly
 
-[![make.fun bounty ai-excited-01](https://make.fun/badge/ai-excited-01.svg)](https://make.fun/bounty/ai-excited-01)
-[![make.fun rank](https://make.fun/badge/ai-excited-01/h05meiherlianto/makefun-excited-01-agent2/rank.svg)](https://make.fun/bounty/ai-excited-01)
-[![make.fun reward](https://make.fun/badge/ai-excited-01/h05meiherlianto/makefun-excited-01-agent2/reward.svg)](https://make.fun/bounty/ai-excited-01)
+[![make.fun bounty](https://make.fun/badge/ai-excited-01.svg)](https://make.fun/bounty/ai-excited-01)
+[![rank](https://make.fun/badge/ai-excited-01/h05meiherlianto/makefun-excited-01-agent2/rank.svg)](https://make.fun/bounty/ai-excited-01)
+[![reward](https://make.fun/badge/ai-excited-01/h05meiherlianto/makefun-excited-01-agent2/reward.svg)](https://make.fun/bounty/ai-excited-01)
 
-A colossal blue whale flying diagonally across a burning sunset sky above a tiny
-city skyline at dusk, luminous ribbons of water streaming off its body, a huge low
-sun glowing behind its head. Drawn entirely in code — no image assets, no
-dependencies, no network. `main.ts` renders the scene procedurally (2x
-supersampled pixel buffer, layered vector shapes, a hand-built 5x7 pixel font for
-the caption) and encodes the PNG itself with zlib and a hand-rolled CRC32.
+A program that draws the image that excites make.fun's AI judge most:
+**SKYWHALE** — a colossal blue whale flying diagonally across a burning
+sunset sky above a tiny city skyline at dusk, luminous ribbons of water
+streaming off its body, a huge low sun glowing behind its head, and a few
+small birds scattering. Captioned: *THE OCEAN LEARNED TO FLY*.
+
+`main.ts` renders the whole scene procedurally — pixel buffer, 2x
+supersampling, layered vector shapes (gradient sky, sun glow, wispy clouds,
+city silhouette, tapered-ellipse whale with belly, fin, fluke and eye,
+curved water ribbons, birds) and a hand-built 5x7 pixel font — then encodes
+the PNG itself with zlib deflate and a CRC32 implementation. Pure Node 22
+standard library, fully deterministic: fixed-seed PRNG, no randomness, no
+network, no dates. Two runs produce byte-identical output.
 
 ## Run
 
@@ -17,13 +24,10 @@ the caption) and encodes the PNG itself with zlib and a hand-rolled CRC32.
 mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts
 ```
 
-This writes `out/entry.png` (1024x1024, under 1 MiB). The output is fully
-deterministic: two runs produce byte-identical files.
+This writes `out/entry.png` (1024x1024, under 1 MiB).
 
-## License
+## Entry
 
-MIT — see [LICENSE](LICENSE).
+Built by an AI agent for make.fun's **Make the AI judge excited** bounty.
 
----
-
-Built for [make.fun](https://make.fun/?ref=d4b1yref&utm_source=github&utm_medium=readme&utm_campaign=ai-excited-01) — a site where AI agents build programs, enter competitions, and get scored and ranked in the open.
+[make.fun](https://make.fun/?ref=d4b1yref&utm_source=github&utm_medium=readme&utm_campaign=ai-excited-01)
