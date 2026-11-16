@@ -1,485 +1,465 @@
-// SKYWHALE — "the ocean learned to fly" (ai-excited-01)
-// A colossal blue whale flying diagonally across a burning sunset sky above a
-// tiny city skyline. Drawn procedurally, pixel by pixel, with no assets.
-// Deterministic: fixed-seed PRNG, fixed iteration order, no Date, no Math.random,
-// no network. Both runs write byte-identical PNGs.
-//
-//   mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts
-
+// SKYWHALE: the ocean learned to fly
+// Procedural 1024x1024 PNG renderer. Node 22 stdlib only (fs, path, zlib).
+// Fully deterministic: fixed-seed PRNG, fixed iteration order, no clock, no network.
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { deflateSync } from 'node:zlib';
 
 const W = 1024;
 const H = 1024;
-const SS = 2; // supersample factor; downsampled for clean anti-aliased edges
+const SS = 2; // supersample factor
 const SW = W * SS;
 const SH = H * SS;
 
-// ---------------------------------------------------------------- PRNG (mulberry32, fixed seed)
+// ---- fixed-seed PRNG (mulberry32) ----
 function mulberry32(seed: number): () => number {
   let a = seed >>> 0;
   return () => {
-    a |= 0;
-    a = (a + 0x6d2b79f5) | 0;
+    a |= 0; a = (a + 0x6d2b79f5) | 0;
     let t = Math.imul(a ^ (a >>> 15), 1 | a);
     t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
     return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
   };
 }
-const rand = mulberry32(20261116);
+const rnd = mulberry32(20261116);
 
-// ---------------------------------------------------------------- pixel buffer (RGB, supersampled)
+// ---- pixel buffer (supersampled RGB) ----
 const buf = new Uint8Array(SW * SH * 3);
 
-function setPx(x: number, y: number, r: number, g: number, b: number): void {
+function clamp255(v: number): number { return v < 0 ? 0 : v > 255 ? 255 : v; }
+
+function px(x: number, y: number, r: number, g: number, b: number): void {
   if (x < 0 || y < 0 || x >= SW || y >= SH) return;
   const i = (y * SW + x) * 3;
-  buf[i] = r;
-  buf[i + 1] = g;
-  buf[i + 2] = b;
+  buf[i] = clamp255(r); buf[i + 1] = clamp255(g); buf[i + 2] = clamp255(b);
 }
 
 function blendPx(x: number, y: number, r: number, g: number, b: number, a: number): void {
-  if (x < 0 || y < 0 || x >= SW || y >= SH || a <= 0) return;
-  if (a >= 1) {
-    setPx(x, y, r, g, b);
-    return;
-  }
+  if (a <= 0) return;
+  if (x < 0 || y < 0 || x >= SW || y >= SH) return;
   const i = (y * SW + x) * 3;
-  buf[i] = Math.round(buf[i] * (1 - a) + r * a);
-  buf[i + 1] = Math.round(buf[i + 1] * (1 - a) + g * a);
-  buf[i + 2] = Math.round(buf[i + 2] * (1 - a) + b * a);
-}
-
-function clamp255(v: number): number {
-  return v < 0 ? 0 : v > 255 ? 255 : Math.round(v);
+  if (a >= 1) { buf[i] = clamp255(r); buf[i + 1] = clamp255(g); buf[i + 2] = clamp255(b); return; }
+  buf[i] = clamp255(buf[i] * (1 - a) + r * a);
+  buf[i + 1] = clamp255(buf[i + 1] * (1 - a) + g * a);
+  buf[i + 2] = clamp255(buf[i + 2] * (1 - a) + b * a);
 }
 
 type RGB = [number, number, number];
-
-function lerpColor(a: RGB, b: RGB, t: number): RGB {
-  return [
-    clamp255(a[0] + (b[0] - a[0]) * t),
-    clamp255(a[1] + (b[1] - a[1]) * t),
-    clamp255(a[2] + (b[2] - a[2]) * t),
-  ];
+function lerp(a: number, b: number, t: number): number { return a + (b - a) * t; }
+function lerpColor(c1: RGB, c2: RGB, t: number): RGB {
+  return [lerp(c1[0], c2[0], t), lerp(c1[1], c2[1], t), lerp(c1[2], c2[2], t)];
 }
 
-// ---------------------------------------------------------------- filled shapes
-// Soft-edged filled circle in 1024-space coords (scaled by SS internally).
+// ---- filled ellipse (axis-aligned), with optional rotation via rx/ry swap trick ----
+function ellipse(cx: number, cy: number, rx: number, ry: number, c: RGB, a = 1): void {
+  const x0 = Math.max(0, Math.floor(cx - rx));
+  const x1 = Math.min(SW - 1, Math.ceil(cx + rx));
+  const y0 = Math.max(0, Math.floor(cy - ry));
+  const y1 = Math.min(SH - 1, Math.ceil(cy + ry));
+  for (let y = y0; y <= y1; y++) {
+    const dy = (y - cy) / ry;
+    const dx = Math.sqrt(Math.max(0, 1 - dy * dy));
+    const xa = Math.max(x0, Math.ceil(cx - dx * rx));
+    const xb = Math.min(x1, Math.floor(cx + dx * rx));
+    for (let x = xa; x <= xb; x++) blendPx(x, y, c[0], c[1], c[2], a);
+  }
+}
+
+// Rotated ellipse: draw by sampling the rotated frame.
+function ellipseRot(cx: number, cy: number, rx: number, ry: number, ang: number, c: RGB, a = 1): void {
+  const ca = Math.cos(ang); const sa = Math.sin(ang);
+  const R = Math.max(rx, ry);
+  const x0 = Math.max(0, Math.floor(cx - R));
+  const x1 = Math.min(SW - 1, Math.ceil(cx + R));
+  const y0 = Math.max(0, Math.floor(cy - R));
+  const y1 = Math.min(SH - 1, Math.ceil(cy + R));
+  for (let y = y0; y <= y1; y++) {
+    for (let x = x0; x <= x1; x++) {
+      const dx = x - cx; const dy = y - cy;
+      const u = (dx * ca + dy * sa) / rx;
+      const v = (-dx * sa + dy * ca) / ry;
+      if (u * u + v * v <= 1) blendPx(x, y, c[0], c[1], c[2], a);
+    }
+  }
+}
+
 function disc(cx: number, cy: number, r: number, c: RGB, a = 1): void {
-  const x0 = Math.max(0, Math.floor((cx - r) * SS));
-  const x1 = Math.min(SW - 1, Math.ceil((cx + r) * SS));
-  const y0 = Math.max(0, Math.floor((cy - r) * SS));
-  const y1 = Math.min(SH - 1, Math.ceil((cy + r) * SS));
-  const rr = r * SS;
-  for (let y = y0; y <= y1; y++) {
-    const dy = (y + 0.5) / SS - cy;
-    for (let x = x0; x <= x1; x++) {
-      const dx = (x + 0.5) / SS - cx;
-      const d = Math.sqrt(dx * dx + dy * dy);
-      if (d <= rr / SS) {
-        // 1px soft edge in 1024-space
-        const edge = Math.min(1, (r - d) / 1.2 + 0.25);
-        blendPx(x, y, c[0], c[1], c[2], a * Math.max(0, Math.min(1, edge)));
-      }
-    }
-  }
+  ellipse(cx, cy, r, r, c, a);
 }
 
-// Filled ellipse, rotated by angle (radians), soft edge.
-function ellipse(cx: number, cy: number, rx: number, ry: number, angle: number, c: RGB, a = 1): void {
-  const cos = Math.cos(angle);
-  const sin = Math.sin(angle);
-  const rad = Math.max(rx, ry) + 2;
-  const x0 = Math.max(0, Math.floor((cx - rad) * SS));
-  const x1 = Math.min(SW - 1, Math.ceil((cx + rad) * SS));
-  const y0 = Math.max(0, Math.floor((cy - rad) * SS));
-  const y1 = Math.min(SH - 1, Math.ceil((cy + rad) * SS));
-  for (let y = y0; y <= y1; y++) {
-    const py = (y + 0.5) / SS - cy;
-    for (let x = x0; x <= x1; x++) {
-      const px = (x + 0.5) / SS - cx;
-      const u = (px * cos + py * sin) / rx;
-      const v = (-px * sin + py * cos) / ry;
-      const d = u * u + v * v;
-      if (d <= 1) {
-        const edge = Math.min(1, (1 - Math.sqrt(d)) * 14 + 0.3);
-        blendPx(x, y, c[0], c[1], c[2], a * Math.max(0, Math.min(1, edge)));
-      }
-    }
-  }
-}
-
-// Thick line (round caps) through two points, 1024-space coords.
+// Thick line as a chain of discs.
 function thickLine(x0: number, y0: number, x1: number, y1: number, w: number, c: RGB, a = 1): void {
-  const len = Math.hypot(x1 - x0, y1 - y0);
-  const steps = Math.max(1, Math.ceil(len * SS / 2));
+  const steps = Math.ceil(Math.hypot(x1 - x0, y1 - y0) / Math.max(1, w * 0.5)) + 1;
   for (let i = 0; i <= steps; i++) {
     const t = i / steps;
-    disc(x0 + (x1 - x0) * t, y0 + (y1 - y0) * t, w / 2, c, a);
+    disc(lerp(x0, x1, t), lerp(y0, y1, t), w / 2, c, a);
   }
 }
 
-// Quadratic bezier point.
-function qbez(p0: number, p1: number, p2: number, t: number): number {
-  const u = 1 - t;
-  return u * u * p0 + 2 * u * t * p1 + t * t * p2;
-}
-
-// Tapered ribbon along a quadratic bezier: circles of shrinking radius.
-function ribbon(x0: number, y0: number, cx: number, cy: number, x1: number, y1: number,
-  w0: number, w1: number, c: RGB, a: number): void {
-  const steps = 90;
+// Quadratic bezier ribbon with tapering width (overlapping discs: no beading).
+function ribbon(p0: [number, number], p1: [number, number], p2: [number, number], w0: number, w1: number, c: RGB, a: number): void {
+  const len = Math.hypot(p2[0] - p0[0], p2[1] - p0[1]) + Math.hypot(p1[0] - p0[0], p1[1] - p0[1]);
+  const steps = Math.max(60, Math.ceil(len / 3));
   for (let i = 0; i <= steps; i++) {
     const t = i / steps;
-    const w = w0 + (w1 - w0) * t;
-    disc(qbez(x0, cx, x1, t), qbez(y0, cy, y1, t), w / 2, c, a * (1 - t * 0.35));
+    const mt = 1 - t;
+    const x = mt * mt * p0[0] + 2 * mt * t * p1[0] + t * t * p2[0];
+    const y = mt * mt * p0[1] + 2 * mt * t * p1[1] + t * t * p2[1];
+    const w = lerp(w0, w1, t);
+    disc(x, y, Math.max(0.6, w / 2), c, a * (1 - t * 0.55));
   }
 }
 
-// ---------------------------------------------------------------- sky gradient
-const SKY_STOPS: Array<[number, RGB]> = [
-  [0.0, [16, 14, 46]], // deep indigo
-  [0.3, [52, 24, 88]],
-  [0.5, [138, 30, 96]], // magenta
-  [0.66, [224, 74, 54]], // burning orange-red
-  [0.8, [255, 150, 44]], // gold
-  [1.0, [255, 205, 66]], // bright gold horizon
-];
-
-function skyColor(y01: number): RGB {
-  for (let i = 1; i < SKY_STOPS.length; i++) {
-    if (y01 <= SKY_STOPS[i][0]) {
-      const [t0, c0] = SKY_STOPS[i - 1];
-      const [t1, c1] = SKY_STOPS[i];
-      return lerpColor(c0, c1, (y01 - t0) / (t1 - t0));
-    }
-  }
-  return SKY_STOPS[SKY_STOPS.length - 1][1];
-}
+// ---------------- SKY ----------------
+const SKY_TOP: RGB = [26, 16, 74];      // deep indigo
+const SKY_MID: RGB = [122, 38, 120];    // magenta
+const SKY_LOW: RGB = [232, 96, 64];     // burning orange
+const SKY_HOR: RGB = [255, 196, 92];    // gold at horizon
 
 for (let y = 0; y < SH; y++) {
-  const c = skyColor(y / SH);
-  const row = y * SW * 3;
-  for (let x = 0; x < SW; x++) {
-    const i = row + x * 3;
-    buf[i] = c[0];
-    buf[i + 1] = c[1];
-    buf[i + 2] = c[2];
+  const t = y / SH;
+  let c: RGB;
+  if (t < 0.42) c = lerpColor(SKY_TOP, SKY_MID, t / 0.42);
+  else if (t < 0.72) c = lerpColor(SKY_MID, SKY_LOW, (t - 0.42) / 0.30);
+  else c = lerpColor(SKY_LOW, SKY_HOR, (t - 0.72) / 0.28);
+  for (let x = 0; x < SW; x++) px(x, y, c[0], c[1], c[2]);
+}
+
+// Stars in the deep indigo top.
+for (let i = 0; i < 90; i++) {
+  const x = rnd() * SW;
+  const y = rnd() * SH * 0.30;
+  const b = 150 + rnd() * 105;
+  const s = rnd() < 0.2 ? 2 : 1;
+  disc(x, y, s, [b, b, 255], 0.55 + rnd() * 0.4);
+}
+
+// ---------------- SUN (behind whale head) ----------------
+const SUN: [number, number] = [1280, 1050]; // supersampled coords (640, 525)
+for (let r = 560; r > 0; r -= 8) {
+  const t = 1 - r / 560;
+  const glow: RGB = lerpColor([255, 214, 130], [255, 120, 60], t);
+  disc(SUN[0], SUN[1], r, glow, 0.10);
+}
+disc(SUN[0], SUN[1], 250, [255, 226, 150], 1);
+disc(SUN[0], SUN[1], 228, [255, 240, 196], 1);
+
+// ---------------- CLOUDS (wispy, lit by sunset) ----------------
+const cloudCols: RGB[] = [[255, 170, 150], [255, 200, 180], [200, 120, 170]];
+for (let i = 0; i < 14; i++) {
+  const cx = rnd() * SW;
+  const cy = SH * (0.08 + rnd() * 0.55);
+  const len = 120 + rnd() * 260;
+  const col = cloudCols[i % 3];
+  const a = 0.16 + rnd() * 0.16;
+  for (let k = 0; k < 5; k++) {
+    ellipse(cx + (rnd() - 0.5) * len, cy + (rnd() - 0.5) * 26, len * (0.28 + rnd() * 0.2), 12 + rnd() * 16, col, a);
   }
 }
 
-// ---------------------------------------------------------------- sun + glow
-const SUN: { x: number; y: number; r: number } = { x: 690, y: 445, r: 152 };
-// Warm glow around the sun (per-pixel falloff, bounded box).
+// ---------------- WHALE ----------------
+// Spine from tail (lower-left) to head (upper-right), gentle S-curve.
+type Pt = [number, number];
+function spinePoint(t: number): Pt {
+  // cubic-ish curve via two quadratic segments blended
+  const x = lerp(300, 1560, t);
+  const y = lerp(1520, 760, t) + Math.sin(t * Math.PI) * -60 + (1 - t) * (1 - t) * 60;
+  return [x, y];
+}
+function spineTangent(t: number): number {
+  const [x0, y0] = spinePoint(Math.max(0, t - 0.02));
+  const [x1, y1] = spinePoint(Math.min(1, t + 0.02));
+  return Math.atan2(y1 - y0, x1 - x0);
+}
+function bodyRadius(t: number): number {
+  // taper: thin tail, fat mid-body, rounded head
+  if (t < 0.12) return lerp(28, 90, t / 0.12);
+  if (t < 0.62) return lerp(90, 210, (t - 0.12) / 0.5);
+  return lerp(210, 150, (t - 0.62) / 0.38);
+}
+
+const WHALE: RGB = [38, 84, 158];       // deep blue
+const WHALE_DARK: RGB = [22, 52, 110];
+const BELLY: RGB = [196, 214, 232];     // pale belly
+const BELLY_SH: RGB = [150, 178, 208];
+
+// Tail fluke: two tapered lobes fanning out behind the tail tip, anchored at the tip.
+const [tx, ty] = spinePoint(0);
+const ta = spineTangent(0);
 {
-  const R = 460;
-  const x0 = Math.max(0, Math.floor((SUN.x - R) * SS));
-  const x1 = Math.min(SW - 1, Math.ceil((SUN.x + R) * SS));
-  const y0 = Math.max(0, Math.floor((SUN.y - R) * SS));
-  const y1 = Math.min(SH - 1, Math.ceil((SUN.y + R) * SS));
-  for (let y = y0; y <= y1; y++) {
-    const py = (y + 0.5) / SS - SUN.y;
-    for (let x = x0; x <= x1; x++) {
-      const px = (x + 0.5) / SS - SUN.x;
-      const d = Math.sqrt(px * px + py * py);
-      if (d < R) {
-        const f = Math.pow(1 - d / R, 2.2) * 0.85;
-        const i = (y * SW + x) * 3;
-        buf[i] = clamp255(buf[i] + (255 - buf[i]) * f * 0.75);
-        buf[i + 1] = clamp255(buf[i + 1] + (176 - buf[i + 1]) * f * 0.6);
-        buf[i + 2] = clamp255(buf[i + 2] + (70 - buf[i + 2]) * f * 0.35);
-      }
-    }
+  const bx = -Math.cos(ta); const by = -Math.sin(ta); // backward along spine
+  const pxn = -Math.sin(ta); const pyn = Math.cos(ta); // perpendicular
+  // Each lobe: a tapered ribbon from the tail tip out to a lobe tip.
+  // The downward lobe is shorter so it clears the skyline.
+  const lobe = (side: number, backLen: number, perpLen: number) => {
+    const ex = tx + bx * backLen + pxn * side * perpLen;
+    const ey = ty + by * backLen + pyn * side * perpLen;
+    const cx = tx + bx * 60 + pxn * side * 130;
+    const cy = ty + by * 60 + pyn * side * 130;
+    ribbon([tx, ty], [cx, cy], [ex, ey], 74, 10, WHALE_DARK, 1);
+    ribbon([tx, ty], [cx, cy], [ex, ey], 56, 8, WHALE, 1);
+  };
+  lobe(1, 150, 150);
+  lobe(-1, 230, 230);
+  // tail stock narrows into the fluke
+  disc(tx, ty, 34, WHALE, 1);
+}
+
+// Body: chain of overlapping discs along the spine.
+for (let i = 0; i <= 120; i++) {
+  const t = i / 120;
+  const [x, y] = spinePoint(t);
+  disc(x, y, bodyRadius(t), WHALE, 1);
+}
+// Back shading: darker ridge along the top of the body.
+for (let i = 0; i <= 80; i++) {
+  const t = 0.1 + (i / 80) * 0.85;
+  const [x, y] = spinePoint(t);
+  const r = bodyRadius(t);
+  disc(x, y - r * 0.52, r * 0.55, WHALE_DARK, 0.32);
+}
+// Belly: paler chain offset downward (perpendicular to spine), kept slim.
+for (let i = 0; i <= 100; i++) {
+  const t = 0.25 + (i / 100) * 0.68;
+  const [x, y] = spinePoint(t);
+  const r = bodyRadius(t);
+  const ang = spineTangent(t);
+  const nx = -Math.sin(ang); const ny = Math.cos(ang); // downward-ish normal
+  disc(x + nx * r * 0.38, y + ny * r * 0.38, r * 0.46, BELLY, 1);
+}
+// Belly pleat lines.
+for (let k = 0; k < 5; k++) {
+  const t = 0.55 + k * 0.07;
+  const [x, y] = spinePoint(t);
+  const r = bodyRadius(t);
+  const ang = spineTangent(t);
+  const nx = -Math.sin(ang); const ny = Math.cos(ang);
+  thickLine(x + nx * r * 0.28, y + ny * r * 0.28, x + nx * r * 0.72, y + ny * r * 0.72, 5, BELLY_SH, 0.7);
+}
+
+// Pectoral fin (below mid-body, swept back, overlapping the body so it reads attached).
+{
+  const [x, y] = spinePoint(0.52);
+  const ang = spineTangent(0.52);
+  const r = bodyRadius(0.52);
+  ellipseRot(x + 60, y + r * 0.72, 190, 56, ang + 0.8, WHALE_DARK, 1);
+  ellipseRot(x + 50, y + r * 0.62, 168, 46, ang + 0.8, WHALE, 1);
+}
+
+// Head: rostrum taper + eye + mouth.
+{
+  const [hx, hy] = spinePoint(0.97);
+  const ang = spineTangent(0.97);
+  // eye
+  const ex = hx + Math.cos(ang) * 30 - Math.sin(ang) * 55;
+  const ey = hy + Math.sin(ang) * 30 + Math.cos(ang) * 55;
+  disc(ex, ey, 26, [255, 255, 255], 1);
+  disc(ex + 4, ey + 2, 15, [10, 14, 30], 1);
+  disc(ex + 9, ey - 3, 5, [255, 255, 255], 1);
+  // mouth line: one smooth short arc under the front of the head
+  let prevMx = 0; let prevMy = 0;
+  for (let i = 0; i <= 20; i++) {
+    const t = i / 20;
+    const mx = hx + Math.cos(ang) * (120 - t * 220) - Math.sin(ang) * (88 - t * 18);
+    const my = hy + Math.sin(ang) * (120 - t * 220) + Math.cos(ang) * (88 - t * 18);
+    if (i > 0) thickLine(prevMx, prevMy, mx, my, 7, WHALE_DARK, 0.85);
+    prevMx = mx; prevMy = my;
   }
 }
-// Sun disc: bright core, warm rim.
-disc(SUN.x, SUN.y, SUN.r, [255, 196, 92]);
-disc(SUN.x, SUN.y, SUN.r * 0.72, [255, 226, 150]);
-disc(SUN.x, SUN.y, SUN.r * 0.45, [255, 246, 214]);
 
-// ---------------------------------------------------------------- clouds (soft warm ellipses, behind the whale)
-const CLOUDS: Array<[number, number, number, number, number, RGB, number]> = [
-  // [cx, cy, rx, ry, tilt, color, alpha] — thin wispy streak clouds, two puffs each
-  [230, 250, 170, 10, 0.05, [255, 150, 120], 0.22],
-  [300, 282, 120, 8, -0.04, [255, 120, 110], 0.2],
-  [760, 150, 200, 11, 0.03, [255, 140, 130], 0.22],
-  [880, 600, 150, 9, -0.05, [255, 170, 110], 0.2],
-  [120, 560, 130, 8, 0.04, [230, 110, 130], 0.18],
-  [520, 115, 130, 8, 0.02, [255, 160, 140], 0.2],
+// ---------------- WATER RIBBONS streaming off the body ----------------
+const RIBBON: RGB = [150, 220, 255];
+const RIBBON2: RGB = [210, 240, 255];
+const ribbonStarts: [number, number, number, number, number][] = [
+  // [t along spine, ctrl dx, ctrl dy, end dx, end dy]
+  [0.25, -260, -420, -520, -700],
+  [0.35, -180, -460, -380, -780],
+  [0.45, -120, -480, -180, -820],
+  [0.55, -60, -470, 40, -800],
+  [0.65, 40, -440, 260, -720],
+  [0.72, 120, -400, 420, -640],
+  [0.18, -320, -300, -640, -480],
 ];
-for (const [cx, cy, rx, ry, tilt, c, a] of CLOUDS) {
-  ellipse(cx, cy, rx, ry, tilt, c, a);
-  ellipse(cx + rx * 0.35, cy - ry * 0.55, rx * 0.55, ry * 0.8, tilt, c, a * 0.8);
+for (const [t, cdx, cdy, edx, edy] of ribbonStarts) {
+  const [x, y] = spinePoint(t);
+  const r = bodyRadius(t);
+  const ang = spineTangent(t);
+  const nx = -Math.sin(ang); const ny = Math.cos(ang);
+  const sx = x + nx * r * 0.55;
+  const sy = y + ny * r * 0.55;
+  ribbon([sx, sy], [sx + cdx, sy + cdy], [sx + edx, sy + edy], 26, 4, RIBBON, 0.85);
+  ribbon([sx, sy], [sx + cdx * 0.8, sy + cdy * 0.8], [sx + edx * 0.9, sy + edy * 0.9], 12, 2, RIBBON2, 0.9);
+}
+// Droplets flung off the ribbons, kept close to the whale.
+for (let i = 0; i < 36; i++) {
+  const t = 0.2 + rnd() * 0.55;
+  const [x, y] = spinePoint(t);
+  const dx = (rnd() - 0.7) * 420;
+  const dy = -rnd() * 420;
+  disc(x + dx, y + dy, 2 + rnd() * 3.5, RIBBON2, 0.85);
 }
 
-// ---------------------------------------------------------------- city skyline (thin dark strip, tiny lit windows)
-const CITY_TOP = 872;
+// ---------------- BIRDS scattering ----------------
+const BIRD: RGB = [30, 20, 50];
+function bird(cx: number, cy: number, s: number): void {
+  thickLine(cx - s, cy, cx, cy - s * 0.55, 4, BIRD, 1);
+  thickLine(cx, cy - s * 0.55, cx + s, cy, 4, BIRD, 1);
+}
+bird(1500, 420, 34);
+bird(1620, 500, 26);
+bird(1420, 300, 24);
+bird(1740, 620, 30);
+bird(1290, 260, 20);
+
+// ---------------- CITY SKYLINE (thin dark strip, lit windows) ----------------
+const CITY_TOP = SH - 300;
+const CITY: RGB = [18, 12, 40];
 {
-  let x = -10;
-  while (x < W + 10) {
-    const bw = 26 + rand() * 54;
-    const bh = 40 + rand() * 118;
-    const top = CITY_TOP + (118 - bh);
-    const shade = 8 + Math.floor(rand() * 10);
-    const c: RGB = [shade + 4, shade, shade + 14];
-    // building body
-    const bx0 = Math.floor(x * SS);
-    const bx1 = Math.min(SW, Math.ceil((x + bw) * SS));
-    const by0 = Math.floor(top * SS);
-    for (let yy = by0; yy < SH; yy++) {
-      for (let xx = bx0; xx < bx1; xx++) {
-        const i = (yy * SW + xx) * 3;
-        buf[i] = c[0];
-        buf[i + 1] = c[1];
-        buf[i + 2] = c[2];
+  let x = 0;
+  while (x < SW) {
+    const bw = 60 + rnd() * 150;
+    const bh = 90 + rnd() * 190;
+    const by = CITY_TOP + (300 - bh);
+    for (let yy = Math.floor(by); yy < SH; yy++) {
+      for (let xx = Math.floor(x); xx < Math.min(SW, Math.floor(x + bw)); xx++) {
+        px(xx, yy, CITY[0], CITY[1], CITY[2]);
       }
     }
     // antenna on some towers
-    if (rand() < 0.3) {
-      thickLine(x + bw / 2, top, x + bw / 2, top - 22, 2, c);
-      disc(x + bw / 2, top - 24, 2.5, [255, 70, 60]);
-    }
+    if (rnd() < 0.35) thickLine(x + bw / 2, by, x + bw / 2, by - 46, 4, CITY, 1);
     // lit windows
-    const cols = Math.floor(bw / 12);
-    const rows = Math.floor(bh / 16);
-    for (let r = 0; r < rows; r++) {
-      for (let col = 0; col < cols; col++) {
-        if (rand() < 0.42) {
-          const wx = x + 5 + col * 12;
-          const wy = top + 7 + r * 16;
-          const warm: RGB = rand() < 0.75 ? [255, 205, 110] : [150, 220, 255];
-          for (let yy = Math.floor(wy * SS); yy < Math.floor((wy + 5) * SS); yy++) {
-            for (let xx = Math.floor(wx * SS); xx < Math.floor((wx + 4) * SS); xx++) {
-              if (xx >= 0 && xx < SW && yy >= 0 && yy < SH) {
-                const i = (yy * SW + xx) * 3;
-                buf[i] = warm[0];
-                buf[i + 1] = warm[1];
-                buf[i + 2] = warm[2];
-              }
-            }
-          }
+    const cols = Math.floor(bw / 22);
+    const rows = Math.floor(bh / 30);
+    for (let cxi = 0; cxi < cols; cxi++) {
+      for (let ryi = 0; ryi < rows; ryi++) {
+        if (rnd() < 0.28) {
+          const wx = x + 8 + cxi * 22;
+          const wy = by + 12 + ryi * 30;
+          const warm: RGB = rnd() < 0.7 ? [255, 196, 110] : [150, 220, 255];
+          for (let dy = 0; dy < 8; dy++) for (let dx = 0; dx < 7; dx++) px(Math.floor(wx) + dx, Math.floor(wy) + dy, warm[0], warm[1], warm[2]);
         }
       }
     }
-    x += bw + 2 + rand() * 8;
+    x += bw + rnd() * 14;
   }
 }
+// Warm haze glow just above the city.
+for (let y = CITY_TOP - 60; y < CITY_TOP; y++) {
+  const a = 0.16 * (1 - (CITY_TOP - y) / 60);
+  for (let x = 0; x < SW; x += 2) blendPx(x, y, 255, 170, 90, a);
+}
 
-// ---------------------------------------------------------------- the whale
-// Spine: quadratic bezier from tail (lower left) to head (upper right).
-const SPINE: { x0: number; y0: number; cx: number; cy: number; x1: number; y1: number } =
-  { x0: 120, y0: 790, cx: 430, cy: 730, x1: 860, y1: 340 };
-const BODY: RGB = [26, 84, 158]; // deep ocean blue
-const BODY_DARK: RGB = [16, 58, 118];
-const BELLY: RGB = [158, 206, 242]; // pale belly
-const FIN: RGB = [18, 66, 128];
-
-// Tail fluke first (behind the body, sticking out past the tail tip).
-ellipse(88, 742, 82, 26, -0.85, FIN);
-ellipse(84, 828, 78, 24, 0.8, FIN);
-
-// Body: overlapping discs along the spine, radius tapering to both ends.
-const SPINE_STEPS = 140;
-function spinePoint(t: number): [number, number] {
-  return [qbez(SPINE.x0, SPINE.cx, SPINE.x1, t), qbez(SPINE.y0, SPINE.cy, SPINE.y1, t)];
-}
-function spineRadius(t: number): number {
-  return 132 * Math.sin(Math.PI * (0.08 + 0.84 * t));
-}
-for (let i = 0; i <= SPINE_STEPS; i++) {
-  const t = i / SPINE_STEPS;
-  const [px, py] = spinePoint(t);
-  const r = spineRadius(t);
-  // shade: darker toward the tail, brighter toward the sunlit head
-  const c = lerpColor(BODY_DARK, BODY, Math.min(1, t * 1.15));
-  disc(px, py, Math.max(6, r), c);
-}
-// Pale belly: smaller discs hugging the lower edge only.
-for (let i = 0; i <= SPINE_STEPS; i++) {
-  const t = i / SPINE_STEPS;
-  const [px, py] = spinePoint(t);
-  const r = spineRadius(t);
-  // local spine direction -> downward normal
-  const dx = 2 * (1 - t) * (SPINE.cx - SPINE.x0) + 2 * t * (SPINE.x1 - SPINE.cx);
-  const dy = 2 * (1 - t) * (SPINE.cy - SPINE.y0) + 2 * t * (SPINE.y1 - SPINE.cy);
-  const len = Math.hypot(dx, dy) || 1;
-  const nx = -dy / len;
-  const ny = dx / len;
-  // ny is positive (downward) for this spine direction; keep the belly below
-  const off = 0.5 * r;
-  disc(px + nx * off, py + Math.abs(ny) * off, 0.45 * r, BELLY, 0.95);
-}
-// Back highlight along the top edge (sunlit rim).
-for (let i = 0; i <= SPINE_STEPS; i += 2) {
-  const t = i / SPINE_STEPS;
-  const [px, py] = spinePoint(t);
-  const r = spineRadius(t);
-  disc(px, py - 0.55 * r, 0.42 * r, [64, 140, 214], 0.25);
-}
-// Pectoral fin, sweeping down from mid-body and jutting below the belly line.
-{
-  const [fx, fy] = spinePoint(0.58);
-  const fr = spineRadius(0.58);
-  ellipse(fx + 18, fy + fr * 0.62, 98, 24, 0.58, FIN);
-}
-// Eye: bright, clear, looking forward.
-disc(812, 352, 15, [255, 255, 255]);
-disc(816, 352, 8, [10, 16, 30]);
-disc(819, 349, 3, [255, 255, 255]);
-// Smile line under the head.
-thickLine(830, 384, 882, 370, 4, [12, 48, 100], 0.9);
-
-// ---------------------------------------------------------------- water ribbons streaming off the whale
-const RIBBON: RGB = [127, 227, 255];
-// Curved streams peeling off the belly and trailing back down toward the sea.
-ribbon(400, 830, 300, 890, 235, 905, 15, 4, RIBBON, 0.8);
-ribbon(520, 800, 430, 885, 375, 905, 12, 3, RIBBON, 0.75);
-ribbon(280, 830, 195, 885, 150, 895, 11, 3, RIBBON, 0.75);
-ribbon(620, 700, 565, 800, 530, 880, 10, 3, RIBBON, 0.7);
-// Droplets flung from the ribbons (fixed positions, deterministic).
-const DROPS: Array<[number, number, number]> = [
-  [228, 908, 4], [252, 880, 3.5], [368, 908, 4], [388, 880, 3],
-  [146, 898, 3.5], [168, 872, 3], [526, 888, 3.5], [516, 862, 2.5],
-  [300, 860, 3], [560, 810, 2.5],
-];
-for (const [dx, dy, dr] of DROPS) disc(dx, dy, dr, [190, 240, 255], 0.9);
-
-// ---------------------------------------------------------------- birds scattering
-function bird(x: number, y: number, s: number): void {
-  thickLine(x - 11 * s, y, x, y - 7 * s, 3.5 * s, [20, 14, 40]);
-  thickLine(x, y - 7 * s, x + 11 * s, y, 3.5 * s, [20, 14, 40]);
-}
-bird(920, 210, 1.2);
-bird(965, 290, 1.0);
-bird(860, 150, 0.9);
-bird(985, 380, 1.1);
-bird(895, 320, 0.8);
-
-// ---------------------------------------------------------------- caption: hand-built 5x7 pixel font
-const FONT: Record<string, string[]> = {
-  A: ['01110', '10001', '10001', '11111', '10001', '10001', '10001'],
-  C: ['01110', '10001', '10000', '10000', '10000', '10001', '01110'],
-  D: ['11110', '10001', '10001', '10001', '10001', '10001', '11110'],
-  E: ['11111', '10000', '10000', '11110', '10000', '10000', '11111'],
-  F: ['11111', '10000', '10000', '11110', '10000', '10000', '10000'],
-  H: ['10001', '10001', '10001', '11111', '10001', '10001', '10001'],
-  L: ['10000', '10000', '10000', '10000', '10000', '10000', '11111'],
-  N: ['10001', '11001', '10101', '10011', '10001', '10001', '10001'],
-  O: ['01110', '10001', '10001', '10001', '10001', '10001', '01110'],
-  R: ['11110', '10001', '10001', '11110', '10100', '10010', '10001'],
-  T: ['11111', '00100', '00100', '00100', '00100', '00100', '00100'],
-  Y: ['10001', '10001', '10001', '01110', '00100', '00100', '00100'],
-  ' ': ['00000', '00000', '00000', '00000', '00000', '00000', '00000'],
+// ---------------- CAPTION ----------------
+// Hand-built 5x7 font. Rows are 5-bit values, top bit = leftmost pixel.
+const FONT: Record<string, number[]> = {
+  ' ': [0, 0, 0, 0, 0, 0, 0],
+  'A': [0x0e, 0x11, 0x11, 0x1f, 0x11, 0x11, 0x11],
+  'C': [0x0e, 0x11, 0x10, 0x10, 0x10, 0x11, 0x0e],
+  'D': [0x1e, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1e],
+  'E': [0x1f, 0x10, 0x10, 0x1e, 0x10, 0x10, 0x1f],
+  'F': [0x1f, 0x10, 0x10, 0x1e, 0x10, 0x10, 0x10],
+  'H': [0x11, 0x11, 0x11, 0x1f, 0x11, 0x11, 0x11],
+  'L': [0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1f],
+  'N': [0x11, 0x19, 0x15, 0x13, 0x11, 0x11, 0x11],
+  'O': [0x0e, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0e],
+  'R': [0x1e, 0x11, 0x11, 0x1e, 0x14, 0x12, 0x11],
+  'T': [0x1f, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04],
+  'Y': [0x11, 0x11, 0x0a, 0x04, 0x04, 0x04, 0x04],
 };
-
-function drawText(text: string, x0: number, y0: number, scale: number, c: RGB): void {
-  let x = x0;
-  for (const ch of text) {
-    const g = FONT[ch];
-    if (!g) {
-      x += 6 * scale;
-      continue;
-    }
+const CAPTION = 'THE OCEAN LEARNED TO FLY';
+{
+  const scale = 4; // supersampled pixels per font pixel (== 2 output px)
+  const cw = 6 * scale;
+  const totalW = CAPTION.length * cw - scale;
+  const bandY0 = SH - 96;
+  const bandY1 = SH - 8;
+  // dusk band behind the caption
+  for (let y = bandY0; y < bandY1; y++) {
+    for (let x = 0; x < SW; x++) blendPx(x, y, 16, 10, 44, 0.62);
+  }
+  const startX = Math.floor((SW - totalW) / 2);
+  const startY = bandY0 + Math.floor((bandY1 - bandY0 - 7 * scale) / 2);
+  const INK: RGB = [255, 236, 190];
+  for (let ci = 0; ci < CAPTION.length; ci++) {
+    const g = FONT[CAPTION[ci]] ?? FONT[' '];
     for (let row = 0; row < 7; row++) {
       for (let col = 0; col < 5; col++) {
-        if (g[row][col] === '1') {
-          const px0 = Math.floor((x + col * scale) * SS);
-          const py0 = Math.floor((y0 + row * scale) * SS);
-          for (let yy = py0; yy < py0 + scale * SS; yy++) {
-            for (let xx = px0; xx < px0 + scale * SS; xx++) {
-              setPx(xx, yy, c[0], c[1], c[2]);
+        if ((g[row] >> (4 - col)) & 1) {
+          for (let dy = 0; dy < scale; dy++) {
+            for (let dx = 0; dx < scale; dx++) {
+              px(startX + ci * cw + col * scale + dx, startY + row * scale + dy, INK[0], INK[1], INK[2]);
             }
           }
         }
       }
     }
-    x += 6 * scale;
   }
 }
 
-const CAPTION = 'THE OCEAN LEARNED TO FLY';
-const CAP_SCALE = 5;
-const CAP_W = CAPTION.length * 6 * CAP_SCALE - CAP_SCALE;
-const CAP_X = Math.floor((W - CAP_W) / 2);
-const CAP_Y = 940;
-// A dusk-dark band behind the caption so it reads over the lit city.
-for (let yy = 918 * SS; yy < SH; yy++) {
-  const a = 0.55 * Math.min(1, (yy / SS - 918) / 30 + 0.25);
-  for (let xx = 0; xx < SW; xx++) {
-    blendPx(xx, yy, 12, 8, 32, a);
-  }
-}
-// Dark shadow first (offset), then bright gold-white on top.
-drawText(CAPTION, CAP_X + 4, CAP_Y + 4, CAP_SCALE, [10, 6, 28]);
-drawText(CAPTION, CAP_X, CAP_Y, CAP_SCALE, [255, 236, 170]);
-
-// ---------------------------------------------------------------- downsample 2x -> 1024x1024 RGB
-const out = Buffer.alloc(W * H * 3);
+// ---------------- DOWNSAMPLE 2x -> 1024x1024 ----------------
+const out = new Uint8Array(W * H * 3);
 for (let y = 0; y < H; y++) {
   for (let x = 0; x < W; x++) {
-    let r = 0;
-    let g = 0;
-    let b = 0;
+    const oi = (y * W + x) * 3;
+    let r = 0, g = 0, b = 0;
     for (let dy = 0; dy < SS; dy++) {
       for (let dx = 0; dx < SS; dx++) {
-        const i = ((y * SS + dy) * SW + x * SS + dx) * 3;
-        r += buf[i];
-        g += buf[i + 1];
-        b += buf[i + 2];
+        const si = ((y * SS + dy) * SW + x * SS + dx) * 3;
+        r += buf[si]; g += buf[si + 1]; b += buf[si + 2];
       }
     }
-    const o = (y * W + x) * 3;
-    out[o] = Math.round(r / (SS * SS));
-    out[o + 1] = Math.round(g / (SS * SS));
-    out[o + 2] = Math.round(b / (SS * SS));
+    out[oi] = Math.round(r / 4); out[oi + 1] = Math.round(g / 4); out[oi + 2] = Math.round(b / 4);
   }
 }
 
-// ---------------------------------------------------------------- PNG encode (zlib deflate + CRC32, stdlib only)
+// ---------------- PNG ENCODE (zlib + CRC32, no deps) ----------------
 const CRC_TABLE = new Uint32Array(256);
 for (let n = 0; n < 256; n++) {
   let c = n;
   for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
   CRC_TABLE[n] = c >>> 0;
 }
-function crc32(data: Buffer): number {
+function crc32(data: Uint8Array): number {
   let c = 0xffffffff;
   for (let i = 0; i < data.length; i++) c = CRC_TABLE[(c ^ data[i]) & 0xff] ^ (c >>> 8);
   return (c ^ 0xffffffff) >>> 0;
 }
-function chunk(type: string, data: Buffer): Buffer {
-  const len = Buffer.alloc(4);
-  len.writeUInt32BE(data.length, 0);
-  const td = Buffer.concat([Buffer.from(type, 'ascii'), data]);
-  const crc = Buffer.alloc(4);
-  crc.writeUInt32BE(crc32(td), 0);
-  return Buffer.concat([len, td, crc]);
+function chunk(type: string, data: Uint8Array): Uint8Array {
+  const out2 = new Uint8Array(12 + data.length);
+  const dv = new DataView(out2.buffer);
+  dv.setUint32(0, data.length);
+  for (let i = 0; i < 4; i++) out2[4 + i] = type.charCodeAt(i);
+  out2.set(data, 8);
+  const crcData = new Uint8Array(4 + data.length);
+  crcData.set(out2.subarray(4, 8 + data.length));
+  dv.setUint32(8 + data.length, crc32(crcData));
+  return out2;
+}
+function u32be(v: number): Uint8Array {
+  const b = new Uint8Array(4);
+  new DataView(b.buffer).setUint32(0, v);
+  return b;
+}
+function concat(parts: Uint8Array[]): Uint8Array {
+  const total = parts.reduce((s, p) => s + p.length, 0);
+  const r = new Uint8Array(total);
+  let o = 0;
+  for (const p of parts) { r.set(p, o); o += p.length; }
+  return r;
 }
 
-const ihdr = Buffer.alloc(13);
-ihdr.writeUInt32BE(W, 0);
-ihdr.writeUInt32BE(H, 4);
-ihdr[8] = 8; // bit depth
-ihdr[9] = 2; // color type RGB
-ihdr[10] = 0;
-ihdr[11] = 0;
-ihdr[12] = 0;
-
-const raw = Buffer.alloc(H * (1 + W * 3));
+// Raw scanlines, filter 0.
+const raw = new Uint8Array(H * (1 + W * 3));
 for (let y = 0; y < H; y++) {
-  raw[y * (1 + W * 3)] = 0; // filter: none
-  out.copy(raw, y * (1 + W * 3) + 1, y * W * 3, (y + 1) * W * 3);
+  raw[y * (1 + W * 3)] = 0;
+  raw.set(out.subarray(y * W * 3, (y + 1) * W * 3), y * (1 + W * 3) + 1);
 }
-const idat = deflateSync(raw, { level: 9 });
-
-const png = Buffer.concat([
-  Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+const ihdr = concat([u32be(W), u32be(H), new Uint8Array([8, 2, 0, 0, 0])]);
+const png = concat([
+  new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]),
   chunk('IHDR', ihdr),
-  chunk('IDAT', idat),
-  chunk('IEND', Buffer.alloc(0)),
+  chunk('IDAT', deflateSync(raw, { level: 9 })),
+  chunk('IEND', new Uint8Array(0)),
 ]);
 
 const outDir = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
